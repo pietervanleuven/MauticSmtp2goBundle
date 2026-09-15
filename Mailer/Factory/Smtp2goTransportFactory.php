@@ -25,7 +25,11 @@ final class Smtp2goTransportFactory extends AbstractTransportFactory
             throw new UnsupportedSchemeException($dsn, 'smtp2go', $this->getSupportedSchemes());
         }
 
-        $apiKey = $this->getPassword($dsn) ?: $this->getUser($dsn);
+        // The API key may live in either DSN segment: smtp2go+api://KEY@default
+        // or user:KEY@default (Mautic's config UI stores it as the password).
+        // Dsn::getPassword() is used directly because the parent helper throws
+        // when the password segment is absent instead of returning null.
+        $apiKey = $dsn->getPassword() ?: $this->getUser($dsn);
         $host   = 'default' === $dsn->getHost() ? null : $dsn->getHost();
         $port   = $dsn->getPort();
 
