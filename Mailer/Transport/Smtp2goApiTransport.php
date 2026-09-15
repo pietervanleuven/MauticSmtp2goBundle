@@ -180,8 +180,10 @@ final class Smtp2goApiTransport extends AbstractApiTransport
                 'mimetype' => $mime,
             ];
 
-            if ('inline' === $headers->getHeaderBody('Content-Disposition') && $cid = $headers->getHeaderParameter('Content-Disposition', 'cid')) {
-                $entry['cid'] = $cid;
+            if ('inline' === $headers->getHeaderBody('Content-Disposition') && $attachment->hasContentId()) {
+                // SMTP2GO has no cid field: the filename of an "inlines" entry
+                // is the content id the HTML references as cid:<filename>.
+                $entry['filename'] = $attachment->getContentId();
                 $payload['inlines'][] = $entry;
             } else {
                 $payload['attachments'][] = $entry;
