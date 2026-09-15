@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace MauticPlugin\MauticSmtp2goBundle\Mailer\Transport;
 
+use Mautic\EmailBundle\Mailer\Message\MauticMessage;
+use Mautic\EmailBundle\Mailer\Transport\TokenTransportInterface;
+use Mautic\EmailBundle\Mailer\Transport\TokenTransportTrait;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Mailer\Envelope;
 use Symfony\Component\Mailer\Exception\HttpTransportException;
@@ -26,10 +29,20 @@ use Symfony\Contracts\HttpClient\ResponseInterface;
  * Auth:     X-Smtp2go-Api-Key header
  * Docs:     https://developers.smtp2go.com/docs/send-an-email
  */
-final class Smtp2goApiTransport extends AbstractApiTransport
+final class Smtp2goApiTransport extends AbstractApiTransport implements TokenTransportInterface
 {
+    use TokenTransportTrait;
+
     private const HOST = 'api.smtp2go.com';
     private const ENDPOINT = '/v3/email/send';
+
+    /**
+     * Recipients Mautic may queue into one tokenized MauticMessage. SMTP2GO
+     * has no per-recipient substitution API, so each recipient still costs
+     * one HTTP request; this bounds memory and the blast radius of a batch
+     * that fails halfway.
+     */
+    private const MAX_BATCH_LIMIT = 100;
 
     private const HEADERS_TO_BYPASS = [
         'from',
@@ -59,10 +72,100 @@ final class Smtp2goApiTransport extends AbstractApiTransport
         return sprintf('smtp2go+api://%s', $this->getEndpoint());
     }
 
+    public function getMaxBatchLimit(): int
+    {
+        return self::MAX_BATCH_LIMIT;
+    }
+
     protected function doSendApi(SentMessage $sentMessage, Email $email, Envelope $envelope): ResponseInterface
     {
         $payload = $this->getPayload($email, $envelope);
 
+        if ($email instanceof MauticMessage && [] !== $email->getMetadata()) {
+            return $this->sendTokenizedBatch($sentMessage, $email->getMetadata(), $payload);
+        }
+
+        [$response, $emailId] = $this->sendPayload($payload);
+
+        if (null !== $emailId) {
+            $sentMessage->setMessageId($emailId);
+        }
+
+        return $response;
+    }
+
+    /**
+     * Send one API request per recipient of a tokenized Mautic batch, with
+     * that recipient's token values substituted into the rendered message.
+     *
+     * @param array<string, array<string, mixed>> $metadata recipient email => Mautic metadata (name, tokens, ...)
+     */
+    private function sendTokenizedBatch(SentMessage $sentMessage, array $metadata, array $payload): ResponseInterface
+    {
+        $response = null;
+        $failures = [];
+
+        foreach ($metadata as $recipientEmail => $contact) {
+            $recipientPayload       = $payload;
+            $recipientPayload['to'] = [$this->formatAddress(new Address($recipientEmail, (string) ($contact['name'] ?? '')))];
+
+            if ($tokens = $contact['tokens'] ?? []) {
+                $recipientPayload = $this->replaceTokens($recipientPayload, $tokens);
+            }
+
+            try {
+                [$response, $emailId] = $this->sendPayload($recipientPayload);
+
+                if (null !== $emailId) {
+                    $sentMessage->setMessageId($emailId);
+                }
+            } catch (HttpTransportException $e) {
+                $failures[$recipientEmail] = $e->getMessage();
+                $response                  = $e->getResponse();
+            }
+        }
+
+        if ([] !== $failures) {
+            throw new HttpTransportException(
+                sprintf('SMTP2GO failed for %d of %d recipient(s): %s', count($failures), count($metadata), json_encode($failures)),
+                $response
+            );
+        }
+
+        return $response;
+    }
+
+    /**
+     * Substitute per-recipient Mautic tokens, mirroring the scope of
+     * MailHelper::searchReplaceTokens(): subject, bodies, and text headers.
+     *
+     * @param array<string, string> $tokens token => replacement value
+     */
+    private function replaceTokens(array $payload, array $tokens): array
+    {
+        $search  = array_keys($tokens);
+        $replace = array_values($tokens);
+
+        foreach (['subject', 'text_body', 'html_body'] as $field) {
+            if (isset($payload[$field])) {
+                $payload[$field] = str_ireplace($search, $replace, $payload[$field]);
+            }
+        }
+
+        foreach ($payload['custom_headers'] ?? [] as $i => $header) {
+            $payload['custom_headers'][$i]['value'] = str_ireplace($search, $replace, $header['value']);
+        }
+
+        return $payload;
+    }
+
+    /**
+     * POST one payload to the SMTP2GO API and validate the response.
+     *
+     * @return array{0: ResponseInterface, 1: ?string} the response and the reported email_id
+     */
+    private function sendPayload(array $payload): array
+    {
         $response = $this->client->request('POST', 'https://'.$this->getEndpoint(), [
             'headers' => [
                 'Accept'              => 'application/json',
@@ -96,11 +199,7 @@ final class Smtp2goApiTransport extends AbstractApiTransport
             );
         }
 
-        if (isset($data['email_id'])) {
-            $sentMessage->setMessageId((string) $data['email_id']);
-        }
-
-        return $response;
+        return [$response, isset($data['email_id']) ? (string) $data['email_id'] : null];
     }
 
     private function getEndpoint(): string
